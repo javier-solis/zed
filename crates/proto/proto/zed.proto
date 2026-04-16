@@ -482,7 +482,11 @@ message Envelope {
     GetCommitData get_commit_data = 447;
     GetCommitDataResponse get_commit_data_response = 448;
     SearchCommits search_commits = 449;
-    SearchCommitsResponse search_commits_response = 450; // current max
+    SearchCommitsResponse search_commits_response = 450;
+    GetDocumentLinks get_document_links = 451;
+    GetDocumentLinksResponse get_document_links_response = 452;
+    ResolveDocumentLink resolve_document_link = 453;
+    ResolveDocumentLinkResponse resolve_document_link_response = 454; // current max
   }
 
   reserved 87 to 88;

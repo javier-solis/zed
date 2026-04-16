@@ -2,16 +2,21 @@ use crate::{
     Anchor, Editor, EditorSettings, EditorSnapshot, FindAllReferences, GoToDefinition,
     GoToDefinitionSplit, GoToTypeDefinition, GoToTypeDefinitionSplit, GotoDefinitionKind,
     HighlightKey, Navigated, PointForPosition, SelectPhase,
-    editor_settings::GoToDefinitionFallback, scroll::ScrollAmount,
+    editor_settings::GoToDefinitionFallback,
+    hover_popover::{InfoPopover, parse_blocks},
+    scroll::ScrollAmount,
 };
-use gpui::{App, AsyncWindowContext, Context, Entity, Modifiers, Pixels, Task, Window, px};
-use language::{Bias, ToOffset};
+use gpui::{
+    App, AsyncWindowContext, Context, Entity, Modifiers, Pixels, SharedString, Task, WeakEntity,
+    Window, px,
+};
+use language::{Bias, Buffer, ToOffset};
 use linkify::{LinkFinder, LinkKind};
 use lsp::LanguageServerId;
-use project::{InlayId, LocationLink, Project, ResolvedPath};
+use project::{HoverBlock, HoverBlockKind, InlayId, LocationLink, Project, ResolvedPath};
 use regex::Regex;
 use settings::Settings;
-use std::{ops::Range, sync::LazyLock};
+use std::{ops::Range, sync::LazyLock, time::Duration};
 use text::OffsetRangeExt;
 use theme::ActiveTheme as _;
 use util::{ResultExt, TryFutureExt as _, maybe};
@@ -66,6 +71,10 @@ pub enum HoverLink {
     File(ResolvedPath),
     Text(LocationLink),
     InlayHint(lsp::Location, LanguageServerId),
+    DocumentLink {
+        target: SharedString,
+        server_id: LanguageServerId,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +160,7 @@ impl Editor {
 
     pub(crate) fn hide_hovered_link(&mut self, cx: &mut Context<Self>) {
         self.hovered_link_state.take();
+        self.hover_state.link_tooltip.take();
         self.clear_highlights(HighlightKey::HoveredLinkState, cx);
     }
 
@@ -234,7 +244,7 @@ impl Editor {
                 else {
                     return Task::ready(Ok(Navigated::No));
                 };
-                let Some(mb_anchor) = self
+                let Some(multi_buffer_anchor) = self
                     .buffer()
                     .read(cx)
                     .snapshot(cx)
@@ -253,7 +263,7 @@ impl Editor {
                         }
                     })
                     .collect();
-                let nav_entry = self.navigation_entry(mb_anchor, cx);
+                let nav_entry = self.navigation_entry(multi_buffer_anchor, cx);
                 let split = Self::is_alt_pressed(&modifiers, cx);
                 let navigate_task =
                     self.navigate_to_hover_links(None, links, nav_entry, split, window, cx);
@@ -336,7 +346,7 @@ pub fn show_link_definition(
         || hovered_link_state
             .links
             .first()
-            .is_some_and(|d| matches!(d, HoverLink::Url(_)));
+            .is_some_and(|d| matches!(d, HoverLink::Url(_) | HoverLink::DocumentLink { .. }));
 
     if same_kind {
         if is_cached && (hovered_link_state.last_trigger_point == trigger_point)
@@ -359,9 +369,36 @@ pub fn show_link_definition(
     let snapshot = snapshot.buffer_snapshot().clone();
     hovered_link_state.task = Some(cx.spawn_in(window, async move |this, cx| {
         async move {
+            // LSP document links take priority: the server explicitly
+            // declares which ranges are clickable, so they are more
+            // accurate than the heuristic-based URL/file detection.
+            let detected_document_link = this
+                .read_with(cx, |editor, cx| {
+                    let buffer_snapshot = buffer.read(cx).snapshot();
+                    let link =
+                        editor.document_link_at(anchor.buffer_id, &anchor, &buffer_snapshot)?;
+                    let multi_buffer_range =
+                        snapshot.buffer_anchor_range_to_anchor_range(link.range.clone())?;
+                    Some((
+                        link.range.clone(),
+                        multi_buffer_range,
+                        link.target.clone(),
+                        link.server_id,
+                    ))
+                })
+                .ok()
+                .flatten();
+
             let result = match &trigger_point {
                 TriggerPoint::Text(_) => {
-                    if let Some((url_range, url)) = find_url(&buffer, anchor, cx.clone()) {
+                    if let Some((_, multi_buffer_range, Some(target), server_id)) =
+                        detected_document_link.clone()
+                    {
+                        Some((
+                            Some(RangeInEditor::Text(multi_buffer_range)),
+                            vec![HoverLink::DocumentLink { target, server_id }],
+                        ))
+                    } else if let Some((url_range, url)) = find_url(&buffer, anchor, cx.clone()) {
                         this.read_with(cx, |_, _| {
                             let range = maybe!({
                                 let range =
@@ -423,7 +460,27 @@ pub fn show_link_definition(
                 hovered_link_state.preferred_kind = preferred_kind;
                 hovered_link_state.symbol_range = result
                     .as_ref()
-                    .and_then(|(symbol_range, _)| symbol_range.clone());
+                    .and_then(|(symbol_range, _)| symbol_range.clone())
+                    .or_else(|| {
+                        // Even if we have no click target yet (e.g. an
+                        // unresolved document link), record the link's range
+                        // so subsequent mouse moves on the same link
+                        // short-circuit in `show_link_definition`.
+                        detected_document_link
+                            .as_ref()
+                            .map(|(_, multi_buffer_range, _, _)| {
+                                RangeInEditor::Text(multi_buffer_range.clone())
+                            })
+                    });
+
+                // The new hover position is not on a document link; drop
+                // any tooltip we showed for a previous link. Without this,
+                // moving from a link onto a goto-definition target leaves
+                // the stale link tooltip behind, since `result` is `Some`
+                // and the `else { hide_hovered_link }` branch never runs.
+                if detected_document_link.is_none() {
+                    editor.hover_state.link_tooltip.take();
+                }
 
                 if let Some((symbol_range, definitions)) = result {
                     hovered_link_state.links = definitions;
@@ -471,10 +528,44 @@ pub fn show_link_definition(
                             ),
                         }
                     }
+                } else if let Some((_, multi_buffer_range, _, _)) = detected_document_link.as_ref()
+                {
+                    let style = gpui::HighlightStyle {
+                        underline: Some(gpui::UnderlineStyle {
+                            thickness: px(1.),
+                            ..Default::default()
+                        }),
+                        color: Some(cx.theme().colors().link_text_hover),
+                        ..Default::default()
+                    };
+                    editor.highlight_text(
+                        HighlightKey::HoveredLinkState,
+                        vec![multi_buffer_range.clone()],
+                        style,
+                        cx,
+                    );
                 } else {
                     editor.hide_hovered_link(cx);
                 }
             })?;
+
+            // Tooltip popover work happens after the main state update so
+            // `hovered_link_state.symbol_range` is set first. That keeps the
+            // short-circuit in `show_link_definition` engaged while the
+            // mouse keeps moving over the same link, preventing the popover
+            // from being torn down and rebuilt on every mouse move.
+            if let Some((buffer_link_range, multi_buffer_range, _, _)) = detected_document_link {
+                update_link_tooltip(
+                    &this,
+                    &buffer,
+                    anchor,
+                    buffer_link_range,
+                    multi_buffer_range,
+                    cx,
+                )
+                .await
+                .log_err();
+            }
 
             anyhow::Ok(())
         }
@@ -483,6 +574,88 @@ pub fn show_link_definition(
     }));
 
     editor.hovered_link_state = Some(hovered_link_state);
+}
+
+async fn update_link_tooltip(
+    editor: &WeakEntity<Editor>,
+    buffer: &Entity<Buffer>,
+    buffer_anchor: text::Anchor,
+    buffer_link_range: Range<text::Anchor>,
+    multi_buffer_range: Range<Anchor>,
+    cx: &mut AsyncWindowContext,
+) -> anyhow::Result<()> {
+    let (enabled, delay_ms) = editor.read_with(cx, |_, cx| {
+        let settings = EditorSettings::get_global(cx);
+        (
+            settings.hover_popover_enabled,
+            settings.hover_popover_delay.0,
+        )
+    })?;
+    if !enabled {
+        return Ok(());
+    }
+
+    let buffer_id = buffer.read_with(cx, |b, _| b.remote_id());
+
+    let symbol_range = RangeInEditor::Text(multi_buffer_range);
+    if editor.read_with(cx, |editor, _| {
+        editor
+            .hover_state
+            .link_tooltip
+            .as_ref()
+            .is_some_and(|p| p.symbol_range == symbol_range)
+    })? {
+        return Ok(());
+    }
+
+    let (mut tooltip, has_unresolved_data) = editor.read_with(cx, |editor, cx| {
+        let snapshot = buffer.read(cx).snapshot();
+        match editor.document_link_at(buffer_id, &buffer_anchor, &snapshot) {
+            Some(link) => (link.tooltip.clone(), link.data.is_some()),
+            None => (None, false),
+        }
+    })?;
+
+    // Run the resolve roundtrip in parallel with the popover delay so the
+    // tooltip appears in lockstep with the regular hover popover when the
+    // server only fills tooltips during `documentLink/resolve`.
+    let delay = cx
+        .background_executor()
+        .timer(Duration::from_millis(delay_ms));
+
+    if tooltip.is_none() && has_unresolved_data {
+        let resolve_task = editor.update(cx, |editor, cx| {
+            editor.resolve_document_link(buffer.clone(), buffer_link_range, cx)
+        })?;
+        let (resolved, ()) = futures::join!(resolve_task, delay);
+        tooltip = resolved.and_then(|link| link.tooltip);
+    } else {
+        delay.await;
+    }
+
+    let Some(tooltip) = tooltip else {
+        editor.update(cx, |editor, cx| {
+            editor.hover_state.link_tooltip.take();
+            cx.notify();
+        })?;
+        return Ok(());
+    };
+
+    let language_registry = editor.read_with(cx, |editor, cx| {
+        editor.project().map(|p| p.read(cx).languages().clone())
+    })?;
+    let blocks = vec![HoverBlock {
+        text: tooltip.to_string(),
+        kind: HoverBlockKind::Markdown,
+    }];
+    let parsed_content = parse_blocks(&blocks, language_registry.as_ref(), None, cx);
+
+    editor.update(cx, |editor, cx| {
+        let popover = InfoPopover::new_link_tooltip(parsed_content, symbol_range, cx);
+        editor.hover_state.link_tooltip = Some(popover);
+        cx.notify();
+    })?;
+    Ok(())
 }
 
 pub(crate) fn find_url(
@@ -794,6 +967,7 @@ mod tests {
     use lsp::request::{GotoDefinition, GotoTypeDefinition};
     use multi_buffer::MultiBufferOffset;
     use settings::InlayHintSettingsContent;
+    use std::str::FromStr;
     use util::{assert_set_eq, path};
     use workspace::item::Item;
 
@@ -2044,5 +2218,386 @@ mod tests {
                     fn test() { do_work(); }
                     fn «do_workˇ»() { test(); }
                 "});
+    }
+
+    #[gpui::test]
+    async fn test_document_links(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+
+        let mut cx = EditorLspTestContext::new_rust(
+            lsp::ServerCapabilities {
+                document_link_provider: Some(lsp::DocumentLinkOptions {
+                    resolve_provider: Some(false),
+                    work_done_progress_options: Default::default(),
+                }),
+                ..Default::default()
+            },
+            cx,
+        )
+        .await;
+
+        cx.set_state(indoc! {"
+            // See LICENSE for details
+            fn main() {
+                println!(\"hello\");
+            }ˇ
+        "});
+
+        let link_range = cx.lsp_range(indoc! {"
+            // See «LICENSE» for details
+            fn main() {
+                println!(\"hello\");
+            }
+        "});
+
+        let mut requests = cx
+            .lsp
+            .set_request_handler::<lsp::request::DocumentLinkRequest, _, _>(
+                move |_, _| async move {
+                    Ok(Some(vec![lsp::DocumentLink {
+                        range: link_range,
+                        target: Some(
+                            lsp::Uri::from_str("https://opensource.org/licenses/MIT").unwrap(),
+                        ),
+                        tooltip: Some("Open license".to_string()),
+                        data: None,
+                    }]))
+                },
+            );
+
+        // Trigger document link fetch via LSP data refresh
+        cx.run_until_parked();
+        requests.next().await;
+        cx.run_until_parked();
+
+        // Cmd-hover over "LICENSE" should highlight it as a link
+        let screen_coord = cx.pixel_position(indoc! {"
+            // See LICˇENSE for details
+            fn main() {
+                println!(\"hello\");
+            }
+        "});
+
+        cx.simulate_mouse_move(screen_coord, None, Modifiers::secondary_key());
+        cx.run_until_parked();
+
+        cx.assert_editor_text_highlights(
+            HighlightKey::HoveredLinkState,
+            indoc! {"
+            // See «LICENSEˇ» for details
+            fn main() {
+                println!(\"hello\");
+            }
+        "},
+        );
+
+        // Clicking opens the URL
+        cx.simulate_click(screen_coord, Modifiers::secondary_key());
+        assert_eq!(
+            cx.opened_url(),
+            Some("https://opensource.org/licenses/MIT".into())
+        );
+    }
+
+    #[gpui::test]
+    async fn test_document_links_take_priority_over_url_detection(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+
+        let mut cx = EditorLspTestContext::new_rust(
+            lsp::ServerCapabilities {
+                document_link_provider: Some(lsp::DocumentLinkOptions {
+                    resolve_provider: Some(false),
+                    work_done_progress_options: Default::default(),
+                }),
+                ..Default::default()
+            },
+            cx,
+        )
+        .await;
+
+        // Text contains a URL, but the LSP provides a document link that
+        // covers a broader range and points to a different target.
+        cx.set_state(indoc! {"
+            // See https://example.com for more infoˇ
+        "});
+
+        let link_range = cx.lsp_range(indoc! {"
+            // «See https://example.com for more info»
+        "});
+
+        let mut requests = cx
+            .lsp
+            .set_request_handler::<lsp::request::DocumentLinkRequest, _, _>(
+                move |_, _| async move {
+                    Ok(Some(vec![lsp::DocumentLink {
+                        range: link_range,
+                        target: Some(
+                            lsp::Uri::from_str("https://lsp-provided.example.com").unwrap(),
+                        ),
+                        tooltip: None,
+                        data: None,
+                    }]))
+                },
+            );
+
+        cx.run_until_parked();
+        requests.next().await;
+        cx.run_until_parked();
+
+        let screen_coord = cx.pixel_position(indoc! {"
+            // See https://examˇple.com for more info
+        "});
+
+        cx.simulate_mouse_move(screen_coord, None, Modifiers::secondary_key());
+        cx.run_until_parked();
+
+        // LSP document link range is highlighted, not just the URL portion
+        cx.assert_editor_text_highlights(
+            HighlightKey::HoveredLinkState,
+            indoc! {"
+            // «See https://example.com for more infoˇ»
+        "},
+        );
+
+        // Clicking navigates to the LSP-provided target, not the detected URL.
+        // (Uri::to_string normalizes "https://host" to "https://host/")
+        cx.simulate_click(screen_coord, Modifiers::secondary_key());
+        assert_eq!(
+            cx.opened_url(),
+            Some("https://lsp-provided.example.com/".into())
+        );
+    }
+
+    #[gpui::test]
+    async fn test_document_link_tooltip_popover(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+
+        let mut cx = EditorLspTestContext::new_rust(
+            lsp::ServerCapabilities {
+                document_link_provider: Some(lsp::DocumentLinkOptions {
+                    resolve_provider: Some(false),
+                    work_done_progress_options: Default::default(),
+                }),
+                ..Default::default()
+            },
+            cx,
+        )
+        .await;
+
+        cx.set_state(indoc! {"
+            // See LICENSE for detailsˇ
+        "});
+
+        let link_range = cx.lsp_range(indoc! {"
+            // See «LICENSE» for details
+        "});
+
+        let mut requests = cx
+            .lsp
+            .set_request_handler::<lsp::request::DocumentLinkRequest, _, _>(
+                move |_, _| async move {
+                    Ok(Some(vec![lsp::DocumentLink {
+                        range: link_range,
+                        target: Some(
+                            lsp::Uri::from_str("https://opensource.org/licenses/MIT").unwrap(),
+                        ),
+                        tooltip: Some("Open license".to_string()),
+                        data: None,
+                    }]))
+                },
+            );
+
+        cx.run_until_parked();
+        requests.next().await;
+        cx.run_until_parked();
+
+        let screen_coord = cx.pixel_position(indoc! {"
+            // See LICˇENSE for details
+        "});
+        cx.simulate_mouse_move(screen_coord, None, Modifiers::secondary_key());
+        let delay_ms = cx.update(|_, cx| EditorSettings::get_global(cx).hover_popover_delay.0);
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(delay_ms + 100));
+        cx.run_until_parked();
+
+        cx.update_editor(|editor, _, cx| {
+            let popover = editor
+                .hover_state
+                .link_tooltip
+                .as_ref()
+                .expect("link tooltip popover should be visible while cmd-hovering a link");
+            let parsed = popover
+                .parsed_content
+                .as_ref()
+                .expect("link tooltip should have parsed markdown content");
+            let text = parsed.read(cx).parsed_markdown().source().to_string();
+            assert_eq!(text, "Open license");
+        });
+
+        cx.simulate_mouse_move(screen_coord, None, Modifiers::none());
+        cx.run_until_parked();
+        cx.update_editor(|editor, _, _| {
+            assert!(
+                editor.hover_state.link_tooltip.is_none(),
+                "link tooltip should be hidden after releasing the modifier key"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_document_link_resolve_on_hover(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+
+        let mut cx = EditorLspTestContext::new_rust(
+            lsp::ServerCapabilities {
+                document_link_provider: Some(lsp::DocumentLinkOptions {
+                    resolve_provider: Some(true),
+                    work_done_progress_options: Default::default(),
+                }),
+                ..Default::default()
+            },
+            cx,
+        )
+        .await;
+
+        cx.set_state(indoc! {"
+            // See LICENSE for detailsˇ
+        "});
+
+        let link_range = cx.lsp_range(indoc! {"
+            // See «LICENSE» for details
+        "});
+        let resolve_data = serde_json::json!({"id": 42});
+
+        let mut document_link_requests = {
+            let resolve_data = resolve_data.clone();
+            cx.lsp
+                .set_request_handler::<lsp::request::DocumentLinkRequest, _, _>(move |_, _| {
+                    let resolve_data = resolve_data.clone();
+                    async move {
+                        Ok(Some(vec![lsp::DocumentLink {
+                            range: link_range,
+                            target: None,
+                            tooltip: None,
+                            data: Some(resolve_data),
+                        }]))
+                    }
+                })
+        };
+
+        let mut resolve_requests = cx
+            .lsp
+            .set_request_handler::<lsp::request::DocumentLinkResolve, _, _>(
+                move |req, _| async move {
+                    Ok(lsp::DocumentLink {
+                        range: req.range,
+                        target: Some(
+                            lsp::Uri::from_str("https://opensource.org/licenses/MIT").unwrap(),
+                        ),
+                        tooltip: Some("Resolved tooltip".to_string()),
+                        data: None,
+                    })
+                },
+            );
+
+        cx.run_until_parked();
+        document_link_requests.next().await;
+        cx.run_until_parked();
+        // The visible-range resolver kicks in once links are cached.
+        resolve_requests.next().await;
+        cx.run_until_parked();
+
+        let screen_coord = cx.pixel_position(indoc! {"
+            // See LICˇENSE for details
+        "});
+        cx.simulate_mouse_move(screen_coord, None, Modifiers::secondary_key());
+        let delay_ms = cx.update(|_, cx| EditorSettings::get_global(cx).hover_popover_delay.0);
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(delay_ms + 100));
+        cx.run_until_parked();
+
+        cx.update_editor(|editor, _, cx| {
+            let popover = editor
+                .hover_state
+                .link_tooltip
+                .as_ref()
+                .expect("link tooltip popover should appear after resolve");
+            let parsed = popover
+                .parsed_content
+                .as_ref()
+                .expect("link tooltip should have parsed markdown content");
+            let text = parsed.read(cx).parsed_markdown().source().to_string();
+            assert_eq!(text, "Resolved tooltip");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_document_link_tooltip_respects_hover_popover_enabled(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+
+        cx.update(|cx| {
+            use gpui::BorrowAppContext as _;
+            cx.update_global::<settings::SettingsStore, _>(|settings, cx| {
+                settings.update_user_settings(cx, |settings| {
+                    settings.editor.hover_popover_enabled = Some(false);
+                });
+            });
+        });
+
+        let mut cx = EditorLspTestContext::new_rust(
+            lsp::ServerCapabilities {
+                document_link_provider: Some(lsp::DocumentLinkOptions {
+                    resolve_provider: Some(false),
+                    work_done_progress_options: Default::default(),
+                }),
+                ..Default::default()
+            },
+            cx,
+        )
+        .await;
+
+        cx.set_state(indoc! {"
+            // See LICENSE for detailsˇ
+        "});
+
+        let link_range = cx.lsp_range(indoc! {"
+            // See «LICENSE» for details
+        "});
+
+        let mut requests = cx
+            .lsp
+            .set_request_handler::<lsp::request::DocumentLinkRequest, _, _>(
+                move |_, _| async move {
+                    Ok(Some(vec![lsp::DocumentLink {
+                        range: link_range,
+                        target: Some(
+                            lsp::Uri::from_str("https://opensource.org/licenses/MIT").unwrap(),
+                        ),
+                        tooltip: Some("Open license".to_string()),
+                        data: None,
+                    }]))
+                },
+            );
+
+        cx.run_until_parked();
+        requests.next().await;
+        cx.run_until_parked();
+
+        let screen_coord = cx.pixel_position(indoc! {"
+            // See LICˇENSE for details
+        "});
+        cx.simulate_mouse_move(screen_coord, None, Modifiers::secondary_key());
+        cx.background_executor
+            .advance_clock(std::time::Duration::from_millis(2000));
+        cx.run_until_parked();
+
+        cx.update_editor(|editor, _, _| {
+            assert!(
+                editor.hover_state.link_tooltip.is_none(),
+                "link tooltip should be suppressed when hover_popover_enabled is false"
+            );
+        });
     }
 }

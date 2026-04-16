@@ -249,8 +249,12 @@ pub fn hover_at_inlay(
 /// selections changed.
 pub fn hide_hover(editor: &mut Editor, cx: &mut Context<Editor>) -> bool {
     let info_popovers = editor.hover_state.info_popovers.drain(..);
-    let diagnostics_popover = editor.hover_state.diagnostic_popover.take();
-    let did_hide = info_popovers.count() > 0 || diagnostics_popover.is_some();
+    let diagnostic_popover = editor.hover_state.diagnostic_popover.take();
+    // Note: `link_tooltip` is intentionally not cleared here. It's owned by
+    // the cmd-hover lifecycle (`hide_hovered_link`); clearing it here would
+    // race with the regular hover provider's `hide_hover` call and tear
+    // down the link tooltip popover right after we showed it.
+    let did_hide = info_popovers.count() > 0 || diagnostic_popover.is_some();
 
     editor.hover_state.info_task = None;
     editor.hover_state.triggered_from = None;
@@ -621,7 +625,7 @@ fn same_diagnostic_hover(editor: &Editor, snapshot: &EditorSnapshot, anchor: Anc
         .unwrap_or(false)
 }
 
-fn parse_blocks(
+pub(crate) fn parse_blocks(
     blocks: &[HoverBlock],
     language_registry: Option<&Arc<LanguageRegistry>>,
     language: Option<Arc<Language>>,
@@ -821,6 +825,10 @@ pub fn open_markdown_url(link: SharedString, window: &mut Window, cx: &mut App) 
 pub struct HoverState {
     pub info_popovers: Vec<InfoPopover>,
     pub diagnostic_popover: Option<DiagnosticPopover>,
+    /// Popover shown for an LSP document link's `tooltip` while the user
+    /// cmd-hovers over the link. Lives independently of `info_popovers` so
+    /// the regular hover provider can still display alongside it.
+    pub link_tooltip: Option<InfoPopover>,
     pub triggered_from: Option<Anchor>,
     pub info_task: Option<Task<Option<()>>>,
     pub closest_mouse_distance: Option<Pixels>,
@@ -829,7 +837,9 @@ pub struct HoverState {
 
 impl HoverState {
     pub fn visible(&self) -> bool {
-        !self.info_popovers.is_empty() || self.diagnostic_popover.is_some()
+        !self.info_popovers.is_empty()
+            || self.diagnostic_popover.is_some()
+            || self.link_tooltip.is_some()
     }
 
     pub fn is_mouse_getting_closer(&mut self, mouse_position: gpui::Point<Pixels>) -> bool {
@@ -840,6 +850,11 @@ impl HoverState {
         let mut popover_bounds = Vec::new();
         for info_popover in &self.info_popovers {
             if let Some(bounds) = info_popover.last_bounds.get() {
+                popover_bounds.push(bounds);
+            }
+        }
+        if let Some(link_tooltip) = &self.link_tooltip {
+            if let Some(bounds) = link_tooltip.last_bounds.get() {
                 popover_bounds.push(bounds);
             }
         }
@@ -900,24 +915,21 @@ impl HoverState {
         }
         // If there is a diagnostic, position the popovers based on that.
         // Otherwise use the start of the hover range
+        let info_popovers_iter = || self.info_popovers.iter().chain(self.link_tooltip.iter());
         let anchor = self
             .diagnostic_popover
             .as_ref()
             .map(|diagnostic_popover| &diagnostic_popover.local_diagnostic.range.start)
             .or_else(|| {
-                self.info_popovers.iter().find_map(|info_popover| {
-                    match &info_popover.symbol_range {
-                        RangeInEditor::Text(range) => Some(&range.start),
-                        RangeInEditor::Inlay(_) => None,
-                    }
+                info_popovers_iter().find_map(|info_popover| match &info_popover.symbol_range {
+                    RangeInEditor::Text(range) => Some(&range.start),
+                    RangeInEditor::Inlay(_) => None,
                 })
             })
             .or_else(|| {
-                self.info_popovers.iter().find_map(|info_popover| {
-                    match &info_popover.symbol_range {
-                        RangeInEditor::Text(_) => None,
-                        RangeInEditor::Inlay(range) => Some(&range.inlay_position),
-                    }
+                info_popovers_iter().find_map(|info_popover| match &info_popover.symbol_range {
+                    RangeInEditor::Text(_) => None,
+                    RangeInEditor::Inlay(range) => Some(&range.inlay_position),
                 })
             })?;
         let mut point = anchor.to_display_point(&snapshot.display_snapshot);
@@ -957,13 +969,16 @@ impl HoverState {
         for info_popover in &mut self.info_popovers {
             elements.push(info_popover.render(max_size, window, cx));
         }
+        if let Some(link_tooltip) = self.link_tooltip.as_mut() {
+            elements.push(link_tooltip.render(max_size, window, cx));
+        }
 
         Some((point, elements))
     }
 
     pub fn focused(&self, window: &mut Window, cx: &mut Context<Editor>) -> bool {
         let mut hover_popover_is_focused = false;
-        for info_popover in &self.info_popovers {
+        for info_popover in self.info_popovers.iter().chain(self.link_tooltip.iter()) {
             if let Some(markdown_view) = &info_popover.parsed_content
                 && markdown_view.focus_handle(cx).is_focused(window)
             {
@@ -993,6 +1008,29 @@ pub struct InfoPopover {
 }
 
 impl InfoPopover {
+    pub(crate) fn new_link_tooltip(
+        parsed_content: Option<Entity<Markdown>>,
+        symbol_range: RangeInEditor,
+        cx: &mut Context<Editor>,
+    ) -> Self {
+        let subscription = parsed_content
+            .as_ref()
+            .map(|content| cx.observe(content, |_, _, cx| cx.notify()));
+        let anchor = match &symbol_range {
+            RangeInEditor::Text(range) => Some(range.start),
+            RangeInEditor::Inlay(_) => None,
+        };
+        Self {
+            symbol_range,
+            parsed_content,
+            scroll_handle: ScrollHandle::new(),
+            keyboard_grace: Rc::new(RefCell::new(false)),
+            anchor,
+            last_bounds: Rc::new(Cell::new(None)),
+            _subscription: subscription,
+        }
+    }
+
     pub(crate) fn render(
         &mut self,
         max_size: Size<Pixels>,

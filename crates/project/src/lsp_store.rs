@@ -12,6 +12,7 @@
 pub mod clangd_ext;
 mod code_lens;
 mod document_colors;
+mod document_links;
 mod document_symbols;
 mod folding_ranges;
 mod inlay_hints;
@@ -24,6 +25,7 @@ pub mod vue_language_server_ext;
 
 use self::code_lens::CodeLensData;
 use self::document_colors::DocumentColorData;
+use self::document_links::DocumentLinksData;
 use self::document_symbols::DocumentSymbolsData;
 use self::inlay_hints::BufferInlayHints;
 use crate::{
@@ -145,6 +147,7 @@ use util::{
 };
 
 pub use document_colors::DocumentColors;
+pub use document_links::LspDocumentLink;
 pub use folding_ranges::LspFoldingRange;
 pub use fs::*;
 pub use language::Location;
@@ -4003,6 +4006,7 @@ pub struct BufferLspData {
     code_lens: Option<CodeLensData>,
     semantic_tokens: Option<SemanticTokensData>,
     folding_ranges: Option<FoldingRangeData>,
+    document_links: Option<DocumentLinksData>,
     document_symbols: Option<DocumentSymbolsData>,
     inlay_hints: BufferInlayHints,
     lsp_requests: HashMap<LspKey, HashMap<LspRequestId, Task<()>>>,
@@ -4023,6 +4027,7 @@ impl BufferLspData {
             code_lens: None,
             semantic_tokens: None,
             folding_ranges: None,
+            document_links: None,
             document_symbols: None,
             inlay_hints: BufferInlayHints::new(buffer, cx),
             lsp_requests: HashMap::default(),
@@ -4047,6 +4052,10 @@ impl BufferLspData {
 
         if let Some(folding_ranges) = &mut self.folding_ranges {
             folding_ranges.ranges.remove(&for_server);
+        }
+
+        if let Some(document_links) = &mut self.document_links {
+            document_links.remove_server_data(for_server);
         }
 
         if let Some(document_symbols) = &mut self.document_symbols {
@@ -4165,6 +4174,7 @@ impl LspStore {
         client.add_entity_request_handler(Self::handle_apply_code_action);
         client.add_entity_request_handler(Self::handle_get_project_symbols);
         client.add_entity_request_handler(Self::handle_resolve_inlay_hint);
+        client.add_entity_request_handler(Self::handle_resolve_document_link);
         client.add_entity_request_handler(Self::handle_get_color_presentation);
         client.add_entity_request_handler(Self::handle_open_buffer_for_symbol);
         client.add_entity_request_handler(Self::handle_refresh_inlay_hints);
@@ -9183,6 +9193,18 @@ impl LspStore {
                     sender_id,
                     lsp_request_id,
                     get_document_symbols,
+                    None,
+                    &mut cx,
+                )
+                .await?;
+            }
+            Request::GetDocumentLinks(get_document_links) => {
+                Self::query_lsp_locally::<GetDocumentLinks>(
+                    lsp_store,
+                    server_id,
+                    sender_id,
+                    lsp_request_id,
+                    get_document_links,
                     None,
                     &mut cx,
                 )
